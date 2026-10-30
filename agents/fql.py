@@ -19,13 +19,20 @@ class FQLAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
+    def critic_inputs(self, batch):
+        """Return the critic inputs at the current and next steps (privileged states if `asym_critic`)."""
+        if self.config['asym_critic']:
+            return batch['states'], batch['next_states']
+        return batch['observations'], batch['next_observations']
+
     def critic_loss(self, batch, grad_params, rng):
         """Compute the FQL critic loss."""
+        critic_observations, next_critic_observations = self.critic_inputs(batch)
         rng, sample_rng = jax.random.split(rng)
         next_actions = self.sample_actions(batch['next_observations'], seed=sample_rng)
         next_actions = jnp.clip(next_actions, -1, 1)
 
-        next_qs = self.network.select('target_critic')(batch['next_observations'], actions=next_actions)
+        next_qs = self.network.select('target_critic')(next_critic_observations, actions=next_actions)
         if self.config['q_agg'] == 'min':
             next_q = next_qs.min(axis=0)
         else:
@@ -33,7 +40,7 @@ class FQLAgent(flax.struct.PyTreeNode):
 
         target_q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_q
 
-        q = self.network.select('critic')(batch['observations'], actions=batch['actions'], params=grad_params)
+        q = self.network.select('critic')(critic_observations, actions=batch['actions'], params=grad_params)
         critic_loss = jnp.square(q - target_q).mean()
 
         return critic_loss, {
@@ -67,7 +74,7 @@ class FQLAgent(flax.struct.PyTreeNode):
 
         # Q loss.
         actor_actions = jnp.clip(actor_actions, -1, 1)
-        qs = self.network.select('critic')(batch['observations'], actions=actor_actions)
+        qs = self.network.select('critic')(self.critic_inputs(batch)[0], actions=actor_actions)
         q = jnp.mean(qs, axis=0)
 
         q_loss = -q.mean()
@@ -177,6 +184,7 @@ class FQLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_states=None,
     ):
         """Create a new agent.
 
@@ -185,6 +193,7 @@ class FQLAgent(flax.struct.PyTreeNode):
             ex_observations: Example batch of observations.
             ex_actions: Example batch of actions.
             config: Configuration dictionary.
+            ex_states: Example batch of privileged states (required if `asym_critic`).
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
@@ -192,12 +201,17 @@ class FQLAgent(flax.struct.PyTreeNode):
         ex_times = ex_actions[..., :1]
         ob_dims = ex_observations.shape[1:]
         action_dim = ex_actions.shape[-1]
+        if config['asym_critic']:
+            assert ex_states is not None, 'asym_critic requires example states.'
+        ex_critic_observations = ex_states if config['asym_critic'] else ex_observations
 
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
-            encoders['critic'] = encoder_module()
+            if not config['asym_critic']:
+                # With `asym_critic`, the critic takes states directly.
+                encoders['critic'] = encoder_module()
             encoders['actor_bc_flow'] = encoder_module()
             encoders['actor_onestep_flow'] = encoder_module()
 
@@ -222,8 +236,8 @@ class FQLAgent(flax.struct.PyTreeNode):
         )
 
         network_info = dict(
-            critic=(critic_def, (ex_observations, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_actions)),
+            critic=(critic_def, (ex_critic_observations, ex_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_critic_observations, ex_actions)),
             actor_bc_flow=(actor_bc_flow_def, (ex_observations, ex_actions, ex_times)),
             actor_onestep_flow=(actor_onestep_flow_def, (ex_observations, ex_actions)),
         )
@@ -265,6 +279,7 @@ def get_config():
             flow_steps=10,  # Number of flow steps.
             normalize_q_loss=False,  # Whether to normalize the Q loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            asym_critic=False,  # Whether the critic takes privileged states instead of observations.
         )
     )
     return config

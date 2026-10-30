@@ -4,6 +4,8 @@ import jax
 import numpy as np
 from tqdm import trange
 
+from envs.state_utils import compute_live_state
+
 
 def supply_rng(f, rng=jax.random.PRNGKey(0)):
     """Helper function to split the random number generator key before each call to the function."""
@@ -58,6 +60,8 @@ def evaluate(
         A tuple containing the statistics, trajectories, and rendered videos.
     """
     actor_fn = supply_rng(agent.sample_actions, rng=jax.random.PRNGKey(np.random.randint(0, 2**32)))
+    # IFQL picks actions with its critic, which takes privileged states with `asym_critic`.
+    needs_states = config is not None and config.get('asym_critic', False) and config['agent_name'] == 'ifql'
     trajs = []
     stats = defaultdict(list)
 
@@ -71,7 +75,8 @@ def evaluate(
         step = 0
         render = []
         while not done:
-            action = actor_fn(observations=observation, temperature=eval_temperature)
+            actor_kwargs = dict(states=compute_live_state(env)) if needs_states else dict()
+            action = actor_fn(observations=observation, temperature=eval_temperature, **actor_kwargs)
             action = np.array(action)
             action = np.clip(action, -1, 1)
 

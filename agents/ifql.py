@@ -28,11 +28,18 @@ class IFQLAgent(flax.struct.PyTreeNode):
         weight = jnp.where(adv >= 0, expectile, (1 - expectile))
         return weight * (diff**2)
 
+    def critic_inputs(self, batch):
+        """Return the value/critic inputs at the current and next steps (privileged states if `asym_critic`)."""
+        if self.config['asym_critic']:
+            return batch['states'], batch['next_states']
+        return batch['observations'], batch['next_observations']
+
     def value_loss(self, batch, grad_params):
         """Compute the IQL value loss."""
-        q1, q2 = self.network.select('target_critic')(batch['observations'], actions=batch['actions'])
+        critic_observations, _ = self.critic_inputs(batch)
+        q1, q2 = self.network.select('target_critic')(critic_observations, actions=batch['actions'])
         q = jnp.minimum(q1, q2)
-        v = self.network.select('value')(batch['observations'], params=grad_params)
+        v = self.network.select('value')(critic_observations, params=grad_params)
         value_loss = self.expectile_loss(q - v, q - v, self.config['expectile']).mean()
 
         return value_loss, {
@@ -44,10 +51,11 @@ class IFQLAgent(flax.struct.PyTreeNode):
 
     def critic_loss(self, batch, grad_params):
         """Compute the IQL critic loss."""
-        next_v = self.network.select('value')(batch['next_observations'])
+        critic_observations, next_critic_observations = self.critic_inputs(batch)
+        next_v = self.network.select('value')(next_critic_observations)
         q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_v
 
-        q1, q2 = self.network.select('critic')(batch['observations'], actions=batch['actions'], params=grad_params)
+        q1, q2 = self.network.select('critic')(critic_observations, actions=batch['actions'], params=grad_params)
         critic_loss = ((q1 - q) ** 2 + (q2 - q) ** 2).mean()
 
         return critic_loss, {
@@ -125,9 +133,15 @@ class IFQLAgent(flax.struct.PyTreeNode):
         observations,
         seed=None,
         temperature=1.0,
+        states=None,
     ):
         """Sample actions from the actor."""
-        orig_observations = observations
+        if self.config['asym_critic']:
+            # The critic that picks the action takes privileged states.
+            assert states is not None, 'IFQL with asym_critic requires states to sample actions.'
+            critic_observations = states
+        else:
+            critic_observations = observations
         if self.config['encoder'] is not None:
             observations = self.network.select('actor_flow_encoder')(observations)
         action_seed, noise_seed = jax.random.split(seed)
@@ -142,7 +156,9 @@ class IFQLAgent(flax.struct.PyTreeNode):
             ),
         )
         n_observations = jnp.repeat(jnp.expand_dims(observations, 0), self.config['num_samples'], axis=0)
-        n_orig_observations = jnp.repeat(jnp.expand_dims(orig_observations, 0), self.config['num_samples'], axis=0)
+        n_critic_observations = jnp.repeat(
+            jnp.expand_dims(critic_observations, 0), self.config['num_samples'], axis=0
+        )
         for i in range(self.config['flow_steps']):
             t = jnp.full((*observations.shape[:-1], self.config['num_samples'], 1), i / self.config['flow_steps'])
             vels = self.network.select('actor_flow')(n_observations, actions, t, is_encoded=True)
@@ -150,7 +166,7 @@ class IFQLAgent(flax.struct.PyTreeNode):
         actions = jnp.clip(actions, -1, 1)
 
         # Pick the action with the highest Q-value.
-        q = self.network.select('critic')(n_orig_observations, actions=actions).min(axis=0)
+        q = self.network.select('critic')(n_critic_observations, actions=actions).min(axis=0)
         actions = actions[jnp.argmax(q)]
         return actions
 
@@ -161,6 +177,7 @@ class IFQLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_states=None,
     ):
         """Create a new agent.
 
@@ -169,6 +186,7 @@ class IFQLAgent(flax.struct.PyTreeNode):
             ex_observations: Example batch of observations.
             ex_actions: Example batch of actions.
             config: Configuration dictionary.
+            ex_states: Example batch of privileged states (required if `asym_critic`).
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
@@ -176,12 +194,18 @@ class IFQLAgent(flax.struct.PyTreeNode):
         ex_times = ex_actions[..., :1]
         action_dim = ex_actions.shape[-1]
 
+        if config['asym_critic']:
+            assert ex_states is not None, 'asym_critic requires example states.'
+        ex_critic_observations = ex_states if config['asym_critic'] else ex_observations
+
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
-            encoders['value'] = encoder_module()
-            encoders['critic'] = encoder_module()
+            if not config['asym_critic']:
+                # With `asym_critic`, the value and critic take states directly.
+                encoders['value'] = encoder_module()
+                encoders['critic'] = encoder_module()
             encoders['actor_flow'] = encoder_module()
 
         # Define networks.
@@ -205,9 +229,9 @@ class IFQLAgent(flax.struct.PyTreeNode):
         )
 
         network_info = dict(
-            value=(value_def, (ex_observations,)),
-            critic=(critic_def, (ex_observations, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_actions)),
+            value=(value_def, (ex_critic_observations,)),
+            critic=(critic_def, (ex_critic_observations, ex_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_critic_observations, ex_actions)),
             actor_flow=(actor_flow_def, (ex_observations, ex_actions, ex_times)),
         )
         if encoders.get('actor_flow') is not None:
@@ -245,6 +269,7 @@ def get_config():
             num_samples=32,  # Number of action samples for rejection sampling.
             flow_steps=10,  # Number of flow steps.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            asym_critic=False,  # Whether the value and critic take privileged states instead of observations.
         )
     )
     return config

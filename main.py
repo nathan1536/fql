@@ -14,7 +14,8 @@ from ml_collections import config_flags
 
 from agents import agents
 from envs.env_utils import make_env_and_datasets
-from utils.datasets import Dataset, ReplayBuffer
+from envs.state_utils import compute_live_state
+from utils.datasets import Dataset, FrameReplayBuffer, ReplayBuffer
 from utils.evaluation import evaluate, flatten
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
@@ -42,6 +43,7 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
 flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling for online fine-tuning.')
+flags.DEFINE_integer('frames_on_disk', 0, 'Whether to store online image frames in a file instead of in memory.')
 
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
@@ -59,11 +61,12 @@ def main(_):
 
     # Make environment and datasets.
     config = FLAGS.agent
-    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=FLAGS.frame_stack)
+    asym_critic = config.get('asym_critic', False)
+    env, eval_env, train_dataset, val_dataset = make_env_and_datasets(
+        FLAGS.env_name, frame_stack=FLAGS.frame_stack, add_states=asym_critic
+    )
     if FLAGS.video_episodes > 0:
         assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
-    if FLAGS.online_steps > 0:
-        assert 'visual' not in FLAGS.env_name, 'Online fine-tuning is currently not supported for visual environments.'
 
     # Initialize agent.
     random.seed(FLAGS.seed)
@@ -71,10 +74,29 @@ def main(_):
 
     # Set up datasets.
     train_dataset = Dataset.create(**train_dataset)
+    # Image observations are stored once per frame (see `FrameReplayBuffer`); the buffer then holds the training
+    # dataset plus `online_steps` transitions, regardless of `buffer_size`.
+    use_frame_buffer = train_dataset['observations'].ndim == 4
+    # With `frames_on_disk`, online frames go to a file in the run directory (deleted at the end of training).
+    frames_path = os.path.join(FLAGS.save_dir, 'replay_frames.dat') if FLAGS.frames_on_disk else None
     if FLAGS.balanced_sampling:
         # Create a separate replay buffer so that we can sample from both the training dataset and the replay buffer.
         example_transition = {k: v[0] for k, v in train_dataset.items()}
-        replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
+        if use_frame_buffer:
+            replay_buffer = FrameReplayBuffer.create(
+                FLAGS.online_steps, example_transition=example_transition, frames_path=frames_path
+            )
+        else:
+            replay_buffer = ReplayBuffer.create(example_transition, size=FLAGS.buffer_size)
+    elif FLAGS.online_steps == 0:
+        # Offline RL only: sample from the training dataset directly instead of copying it into a replay buffer.
+        replay_buffer = train_dataset
+    elif use_frame_buffer:
+        # Use the training dataset as the replay buffer.
+        train_dataset = FrameReplayBuffer.create(
+            FLAGS.online_steps, init_dataset=train_dataset, frames_path=frames_path
+        )
+        replay_buffer = train_dataset
     else:
         # Use the training dataset as the replay buffer.
         train_dataset = ReplayBuffer.create_from_initial_dataset(
@@ -93,11 +115,13 @@ def main(_):
     example_batch = train_dataset.sample(1)
 
     agent_class = agents[config['agent_name']]
+    create_kwargs = dict(ex_states=example_batch['states']) if asym_critic else dict()
     agent = agent_class.create(
         FLAGS.seed,
         example_batch['observations'],
         example_batch['actions'],
         config,
+        **create_kwargs,
     )
 
     # Restore agent.
@@ -114,6 +138,14 @@ def main(_):
     done = True
     expl_metrics = dict()
     online_rng = jax.random.PRNGKey(FLAGS.seed)
+    # IFQL picks actions with its critic, which takes privileged states with `asym_critic`.
+    actor_needs_states = asym_critic and config['agent_name'] == 'ifql'
+    # The replay buffer stores single frames, as the datasets do; `sample` stacks them.
+    frame_channels = train_dataset['observations'].shape[-1]
+
+    def to_frame(ob):
+        return ob[..., -frame_channels:] if FLAGS.frame_stack is not None else ob
+
     for i in tqdm.tqdm(range(1, FLAGS.offline_steps + FLAGS.online_steps + 1), smoothing=0.1, dynamic_ncols=True):
         if i <= FLAGS.offline_steps:
             # Offline RL.
@@ -130,12 +162,17 @@ def main(_):
             if done:
                 step = 0
                 ob, _ = env.reset()
+                if asym_critic:
+                    state = compute_live_state(env)
 
-            action = agent.sample_actions(observations=ob, temperature=1, seed=key)
+            actor_kwargs = dict(states=state) if actor_needs_states else dict()
+            action = agent.sample_actions(observations=ob, temperature=1, seed=key, **actor_kwargs)
             action = np.array(action)
 
             next_ob, reward, terminated, truncated, info = env.step(action.copy())
             done = terminated or truncated
+            if asym_critic:
+                next_state = compute_live_state(env)
 
             if 'antmaze' in FLAGS.env_name and (
                 'diverse' in FLAGS.env_name or 'play' in FLAGS.env_name or 'umaze' in FLAGS.env_name
@@ -143,16 +180,18 @@ def main(_):
                 # Adjust reward for D4RL antmaze.
                 reward = reward - 1.0
 
-            replay_buffer.add_transition(
-                dict(
-                    observations=ob,
-                    actions=action,
-                    rewards=reward,
-                    terminals=float(done),
-                    masks=1.0 - terminated,
-                    next_observations=next_ob,
-                )
+            transition = dict(
+                observations=to_frame(ob),
+                actions=action,
+                rewards=reward,
+                terminals=float(done),
+                masks=1.0 - terminated,
+                next_observations=to_frame(next_ob),
             )
+            if asym_critic:
+                transition.update(states=state, next_states=next_state)
+                state = next_state
+            replay_buffer.add_transition(transition)
             ob = next_ob
 
             if done:
@@ -217,6 +256,8 @@ def main(_):
 
     train_logger.close()
     eval_logger.close()
+    if frames_path is not None and os.path.exists(frames_path):
+        os.remove(frames_path)
 
 
 if __name__ == '__main__':

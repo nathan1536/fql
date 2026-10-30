@@ -1,4 +1,5 @@
 import collections
+import os
 import re
 import time
 
@@ -6,8 +7,93 @@ import gymnasium
 import numpy as np
 import ogbench
 from gymnasium.spaces import Box
+from ogbench.relabel_utils import relabel_dataset
 
-from utils.datasets import Dataset
+from utils.datasets import Dataset, IndexedArray
+
+
+def load_shared_obs_dataset(dataset_path):
+    """Load an OGBench dataset without duplicating observations.
+
+    Equivalent to `ogbench.utils.load_dataset(dataset_path, ob_dtype=np.uint8, add_info=True)`, except that
+    'observations' and 'next_observations' are `IndexedArray` views into a single copy of the stored observations.
+    The regular loader keeps three copies in memory at its peak, which does not fit for visual datasets.
+    """
+    file = np.load(dataset_path)
+
+    obs = file['observations'][...].astype(np.uint8, copy=False)
+    actions = file['actions'][...].astype(np.float32, copy=False)
+    terminals = file['terminals'][...].astype(np.float32, copy=False)
+
+    ob_idxs, next_ob_idxs = get_transition_idxs(terminals)
+    new_terminals = np.concatenate([terminals[1:], [1.0]])
+
+    dataset = dict(
+        observations=IndexedArray(obs, ob_idxs),
+        next_observations=IndexedArray(obs, next_ob_idxs),
+        actions=actions[ob_idxs],
+        terminals=new_terminals[ob_idxs].astype(np.float32),
+    )
+    for k in ['qpos', 'qvel', 'button_states']:
+        if k in file:
+            dataset[k] = file[k][...][ob_idxs]
+
+    return dataset
+
+
+def get_transition_idxs(terminals):
+    """Return the rows of the observations and next observations of each transition in an OGBench dataset file.
+
+    These are the same masks as in the regular (non-compact) `ogbench.utils.load_dataset`.
+    """
+    ob_mask = (1.0 - terminals).astype(bool)
+    next_ob_mask = np.concatenate([[False], ob_mask[:-1]])
+    return np.nonzero(ob_mask)[0], np.nonzero(next_ob_mask)[0]
+
+
+def add_states_to_dataset(dataset, dataset_path):
+    """Add 'states' and 'next_states' from `<dataset>-states.npz` (see `scripts/reconstruct_states.py`)."""
+    states_path = dataset_path.removesuffix('.npz') + '-states.npz'
+    if not os.path.exists(states_path):
+        dataset_name = os.path.basename(dataset_path).removesuffix('.npz').removesuffix('-val')
+        raise FileNotFoundError(
+            f'{states_path} not found. Run: python scripts/reconstruct_states.py --dataset_name={dataset_name}'
+        )
+    states = np.load(states_path)['states']
+    terminals = np.load(dataset_path)['terminals']
+    assert len(states) == len(terminals), f'{states_path} does not match {dataset_path}.'
+
+    ob_idxs, next_ob_idxs = get_transition_idxs(terminals)
+    dataset['states'] = IndexedArray(states, ob_idxs)
+    dataset['next_states'] = IndexedArray(states, next_ob_idxs)
+
+
+def get_ogbench_names(dataset_name):
+    """Return the environment and dataset file names of an OGBench single-task dataset name."""
+    splits = dataset_name.split('-')
+    pos = splits.index('singletask')
+    env_name = '-'.join(splits[: pos - 1] + splits[pos:])  # Remove the dataset type.
+    dataset_name = '-'.join(splits[:pos] + splits[-1:])  # Remove the words 'singletask' and 'task\d' (if exists).
+    return env_name, dataset_name
+
+
+def make_ogbench_visual_env_and_datasets(dataset_name, dataset_dir=ogbench.utils.DEFAULT_DATASET_DIR):
+    """Memory-efficient version of `ogbench.make_env_and_datasets` for visual single-task datasets."""
+    env_name, dataset_name = get_ogbench_names(dataset_name)
+    env = gymnasium.make(env_name)
+
+    dataset_dir = os.path.expanduser(dataset_dir)
+    ogbench.download_datasets([dataset_name], dataset_dir)
+    train_dataset = load_shared_obs_dataset(os.path.join(dataset_dir, f'{dataset_name}.npz'))
+    val_dataset = load_shared_obs_dataset(os.path.join(dataset_dir, f'{dataset_name}-val.npz'))
+
+    # Add reward information, then remove the information keys (as with `add_info=False`).
+    for dataset in [train_dataset, val_dataset]:
+        relabel_dataset(env_name, env, dataset)
+        for k in ['qpos', 'qvel', 'button_states']:
+            dataset.pop(k, None)
+
+    return env, train_dataset, val_dataset
 
 
 class EpisodeMonitor(gymnasium.Wrapper):
@@ -88,21 +174,38 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), reward, terminated, truncated, info
 
 
-def make_env_and_datasets(env_name, frame_stack=None, action_clip_eps=1e-5):
+def make_env_and_datasets(
+    env_name,
+    frame_stack=None,
+    action_clip_eps=1e-5,
+    dataset_dir=ogbench.utils.DEFAULT_DATASET_DIR,
+    add_states=False,
+):
     """Make offline RL environment and datasets.
 
     Args:
         env_name: Name of the environment or dataset.
         frame_stack: Number of frames to stack.
         action_clip_eps: Epsilon for action clipping.
+        dataset_dir: Directory of the OGBench datasets.
+        add_states: Whether to add privileged 'states' and 'next_states' to the datasets (OGBench manipulation only).
 
     Returns:
         A tuple of the environment, evaluation environment, training dataset, and validation dataset.
     """
+    if add_states:
+        assert 'singletask' in env_name, 'States are only supported for OGBench single-task datasets.'
 
     if 'singletask' in env_name:
         # OGBench.
-        env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
+        if 'visual' in env_name:
+            env, train_dataset, val_dataset = make_ogbench_visual_env_and_datasets(env_name, dataset_dir=dataset_dir)
+        else:
+            env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name, dataset_dir=dataset_dir)
+        if add_states:
+            dataset_path = os.path.join(os.path.expanduser(dataset_dir), get_ogbench_names(env_name)[1])
+            add_states_to_dataset(train_dataset, f'{dataset_path}.npz')
+            add_states_to_dataset(val_dataset, f'{dataset_path}-val.npz')
         eval_env = ogbench.make_env_and_datasets(env_name, env_only=True)
         env = EpisodeMonitor(env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         eval_env = EpisodeMonitor(eval_env, filter_regexes=['.*privileged.*', '.*proprio.*'])

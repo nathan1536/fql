@@ -25,11 +25,18 @@ class IQLAgent(flax.struct.PyTreeNode):
         weight = jnp.where(adv >= 0, expectile, (1 - expectile))
         return weight * (diff**2)
 
+    def critic_inputs(self, batch):
+        """Return the value/critic inputs at the current and next steps (privileged states if `asym_critic`)."""
+        if self.config['asym_critic']:
+            return batch['states'], batch['next_states']
+        return batch['observations'], batch['next_observations']
+
     def value_loss(self, batch, grad_params):
         """Compute the IQL value loss."""
-        q1, q2 = self.network.select('target_critic')(batch['observations'], actions=batch['actions'])
+        critic_observations, _ = self.critic_inputs(batch)
+        q1, q2 = self.network.select('target_critic')(critic_observations, actions=batch['actions'])
         q = jnp.minimum(q1, q2)
-        v = self.network.select('value')(batch['observations'], params=grad_params)
+        v = self.network.select('value')(critic_observations, params=grad_params)
         value_loss = self.expectile_loss(q - v, q - v, self.config['expectile']).mean()
 
         return value_loss, {
@@ -41,10 +48,11 @@ class IQLAgent(flax.struct.PyTreeNode):
 
     def critic_loss(self, batch, grad_params):
         """Compute the IQL critic loss."""
-        next_v = self.network.select('value')(batch['next_observations'])
+        critic_observations, next_critic_observations = self.critic_inputs(batch)
+        next_v = self.network.select('value')(next_critic_observations)
         q = batch['rewards'] + self.config['discount'] * batch['masks'] * next_v
 
-        q1, q2 = self.network.select('critic')(batch['observations'], actions=batch['actions'], params=grad_params)
+        q1, q2 = self.network.select('critic')(critic_observations, actions=batch['actions'], params=grad_params)
         critic_loss = ((q1 - q) ** 2 + (q2 - q) ** 2).mean()
 
         return critic_loss, {
@@ -58,8 +66,9 @@ class IQLAgent(flax.struct.PyTreeNode):
         """Compute the actor loss (AWR or DDPG+BC)."""
         if self.config['actor_loss'] == 'awr':
             # AWR loss.
-            v = self.network.select('value')(batch['observations'])
-            q1, q2 = self.network.select('critic')(batch['observations'], actions=batch['actions'])
+            critic_observations, _ = self.critic_inputs(batch)
+            v = self.network.select('value')(critic_observations)
+            q1, q2 = self.network.select('critic')(critic_observations, actions=batch['actions'])
             q = jnp.minimum(q1, q2)
             adv = q - v
 
@@ -87,7 +96,7 @@ class IQLAgent(flax.struct.PyTreeNode):
                 q_actions = jnp.clip(dist.mode(), -1, 1)
             else:
                 q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
-            q1, q2 = self.network.select('critic')(batch['observations'], actions=q_actions)
+            q1, q2 = self.network.select('critic')(self.critic_inputs(batch)[0], actions=q_actions)
             q = jnp.minimum(q1, q2)
 
             # Normalize Q values by the absolute mean to make the loss scale invariant.
@@ -175,6 +184,7 @@ class IQLAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_states=None,
     ):
         """Create a new agent.
 
@@ -183,18 +193,25 @@ class IQLAgent(flax.struct.PyTreeNode):
             ex_observations: Example batch of observations.
             ex_actions: Example batch of actions.
             config: Configuration dictionary.
+            ex_states: Example batch of privileged states (required if `asym_critic`).
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
 
         action_dim = ex_actions.shape[-1]
 
+        if config['asym_critic']:
+            assert ex_states is not None, 'asym_critic requires example states.'
+        ex_critic_observations = ex_states if config['asym_critic'] else ex_observations
+
         # Define encoders.
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
-            encoders['value'] = encoder_module()
-            encoders['critic'] = encoder_module()
+            if not config['asym_critic']:
+                # With `asym_critic`, the value and critic take states directly.
+                encoders['value'] = encoder_module()
+                encoders['critic'] = encoder_module()
             encoders['actor'] = encoder_module()
 
         # Define networks.
@@ -220,9 +237,9 @@ class IQLAgent(flax.struct.PyTreeNode):
         )
 
         network_info = dict(
-            value=(value_def, (ex_observations,)),
-            critic=(critic_def, (ex_observations, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_actions)),
+            value=(value_def, (ex_critic_observations,)),
+            critic=(critic_def, (ex_critic_observations, ex_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_critic_observations, ex_actions)),
             actor=(actor_def, (ex_observations,)),
         )
         networks = {k: v[0] for k, v in network_info.items()}
@@ -256,6 +273,7 @@ def get_config():
             alpha=10.0,  # Temperature in AWR or BC coefficient in DDPG+BC.
             const_std=True,  # Whether to use constant standard deviation for the actor.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            asym_critic=False,  # Whether the value and critic take privileged states instead of observations.
         )
     )
     return config

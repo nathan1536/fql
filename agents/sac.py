@@ -7,6 +7,7 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 
+from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import Actor, LogParam, Value
 
@@ -21,13 +22,20 @@ class SACAgent(flax.struct.PyTreeNode):
     network: Any
     config: Any = nonpytree_field()
 
+    def critic_inputs(self, batch):
+        """Return the critic inputs at the current and next steps (privileged states if `asym_critic`)."""
+        if self.config['asym_critic']:
+            return batch['states'], batch['next_states']
+        return batch['observations'], batch['next_observations']
+
     def critic_loss(self, batch, grad_params, rng):
         """Compute the SAC critic loss."""
+        critic_observations, next_critic_observations = self.critic_inputs(batch)
         rng, sample_rng = jax.random.split(rng)
         next_dist = self.network.select('actor')(batch['next_observations'])
         next_actions, next_log_probs = next_dist.sample_and_log_prob(seed=sample_rng)
 
-        next_qs = self.network.select('target_critic')(batch['next_observations'], next_actions)
+        next_qs = self.network.select('target_critic')(next_critic_observations, next_actions)
         if self.config['q_agg'] == 'min':
             next_q = next_qs.min(axis=0)
         else:
@@ -40,7 +48,7 @@ class SACAgent(flax.struct.PyTreeNode):
                 target_q - self.config['discount'] * batch['masks'] * next_log_probs * self.network.select('alpha')()
             )
 
-        q = self.network.select('critic')(batch['observations'], batch['actions'], params=grad_params)
+        q = self.network.select('critic')(critic_observations, batch['actions'], params=grad_params)
         critic_loss = jnp.square(q - target_q).mean()
 
         return critic_loss, {
@@ -56,7 +64,7 @@ class SACAgent(flax.struct.PyTreeNode):
         actions, log_probs = dist.sample_and_log_prob(seed=rng)
 
         # Actor loss.
-        qs = self.network.select('critic')(batch['observations'], actions)
+        qs = self.network.select('critic')(self.critic_inputs(batch)[0], actions)
         q = jnp.mean(qs, axis=0)
 
         actor_loss = (log_probs * self.network.select('alpha')() - q).mean()
@@ -144,6 +152,7 @@ class SACAgent(flax.struct.PyTreeNode):
         ex_observations,
         ex_actions,
         config,
+        ex_states=None,
     ):
         """Create a new agent.
 
@@ -152,6 +161,7 @@ class SACAgent(flax.struct.PyTreeNode):
             ex_observations: Example batch of observations.
             ex_actions: Example batch of actions.
             config: Configuration dictionary.
+            ex_states: Example batch of privileged states (required if `asym_critic`).
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
@@ -161,11 +171,25 @@ class SACAgent(flax.struct.PyTreeNode):
         if config['target_entropy'] is None:
             config['target_entropy'] = -config['target_entropy_multiplier'] * action_dim
 
+        if config['asym_critic']:
+            assert ex_states is not None, 'asym_critic requires example states.'
+        ex_critic_observations = ex_states if config['asym_critic'] else ex_observations
+
+        # Define encoders.
+        encoders = dict()
+        if config['encoder'] is not None:
+            encoder_module = encoder_modules[config['encoder']]
+            if not config['asym_critic']:
+                # With `asym_critic`, the critic takes states directly.
+                encoders['critic'] = encoder_module()
+            encoders['actor'] = encoder_module()
+
         # Define networks.
         critic_def = Value(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             num_ensembles=2,
+            encoder=encoders.get('critic'),
         )
         actor_def = Actor(
             hidden_dims=config['actor_hidden_dims'],
@@ -175,14 +199,15 @@ class SACAgent(flax.struct.PyTreeNode):
             state_dependent_std=config['state_dependent_std'],
             const_std=False,
             final_fc_init_scale=config['actor_fc_scale'],
+            encoder=encoders.get('actor'),
         )
 
         # Define the dual alpha variable.
         alpha_def = LogParam()
 
         network_info = dict(
-            critic=(critic_def, (ex_observations, ex_actions)),
-            target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_actions)),
+            critic=(critic_def, (ex_critic_observations, ex_actions)),
+            target_critic=(copy.deepcopy(critic_def), (ex_critic_observations, ex_actions)),
             actor=(actor_def, (ex_observations,)),
             alpha=(alpha_def, ()),
         )
@@ -219,6 +244,8 @@ def get_config():
             actor_fc_scale=0.01,  # Final layer initialization scale for actor.
             q_agg='min',  # Aggregation function for target Q values.
             backup_entropy=False,  # Whether to back up entropy in the critic loss.
+            encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            asym_critic=False,  # Whether the critic takes privileged states instead of observations.
         )
     )
     return config
