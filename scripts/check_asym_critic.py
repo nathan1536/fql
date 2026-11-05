@@ -102,10 +102,36 @@ def check_pixels(name, get_config):
     print(f'{name}: pixel actor + state critic OK (state-only modules: {critic_modules}, actor: {actor_modules})')
 
 
+def check_critic_observations():
+    """FQL with separate critic observations equal to the observations must equal the original FQL."""
+    rng = np.random.default_rng(0)
+    batches = [make_batch(rng, (64, 64, 9), np.uint8) for _ in range(NUM_UPDATES)]
+    for batch in batches:
+        batch['critic_observations'] = batch['observations']
+        batch['next_critic_observations'] = batch['next_observations']
+
+    def run_fql(**kwargs):
+        config = small_config(fql_config, encoder='impala_small', **kwargs)
+        agent = agents['fql'].create(
+            0, batches[0]['observations'], batches[0]['actions'], config,
+            ex_critic_observations=batches[0]['critic_observations'],
+        )
+        for batch in batches:
+            agent, _ = agent.update(batch)
+        return agent.network.params
+
+    same = jax.tree_util.tree_all(
+        jax.tree_util.tree_map(np.array_equal, run_fql(), run_fql(critic_observations=True))
+    )
+    assert same, 'fql: critic_observations == observations differs from the original agent.'
+    print(f'fql: critic_observations identical to the original agent after {NUM_UPDATES} updates (pixels)')
+
+
 def main():
     for name, get_config in [('fql', fql_config), ('iql', iql_config), ('ifql', ifql_config), ('sac', sac_config)]:
         check_equivalence(name, get_config)
         check_pixels(name, get_config)
+    check_critic_observations()
     print('PASSED')
 
 

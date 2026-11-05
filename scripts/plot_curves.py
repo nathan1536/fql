@@ -23,7 +23,7 @@ from absl import app, flags  # noqa: E402
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_multi_string('run', None, 'Series as "label=glob" (one directory per seed).')
+flags.DEFINE_multi_string('run', None, 'Series as "label=glob[,glob...]" (one directory per seed).')
 flags.DEFINE_string('out', 'exp/plots/curves.png', 'Output image path (a CSV with the same name is also written).')
 flags.DEFINE_string('metric', 'evaluation/success', 'Column of eval.csv to plot.')
 flags.DEFINE_string('title', None, 'Plot title.')
@@ -72,7 +72,8 @@ def main(_):
     series = []
     for spec in FLAGS.run:
         label, pattern = spec.split('=', 1)
-        run_dirs = sorted(d for d in glob.glob(pattern) if os.path.exists(os.path.join(d, 'eval.csv')))
+        matches = [d for p in pattern.split(',') for d in glob.glob(p)]
+        run_dirs = sorted(d for d in set(matches) if os.path.exists(os.path.join(d, 'eval.csv')))
         assert run_dirs, f'No runs match {pattern}'
         runs = [load_run(d, FLAGS.metric) for d in run_dirs]
         # Keep the evaluation steps that every seed has (runs may still be in progress).

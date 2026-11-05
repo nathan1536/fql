@@ -9,6 +9,7 @@ import ogbench
 from gymnasium.spaces import Box
 from ogbench.relabel_utils import relabel_dataset
 
+from envs.camera_utils import CameraWrapper, camera_suffix
 from utils.datasets import Dataset, IndexedArray
 
 
@@ -68,6 +69,23 @@ def add_states_to_dataset(dataset, dataset_path):
     dataset['next_states'] = IndexedArray(states, next_ob_idxs)
 
 
+def add_critic_observations_to_dataset(dataset, dataset_path, critic_obs_path):
+    """Add 'critic_observations' and 'next_critic_observations' for a separate critic input (e.g., another camera).
+
+    `critic_obs_path` is an .npy file with one frame per row of the dataset file (see `scripts/npz_to_npy.py`). It is
+    memory-mapped, so its frames do not need to fit in memory.
+    """
+    if not os.path.exists(critic_obs_path):
+        raise FileNotFoundError(f'{critic_obs_path} not found. Run scripts/render_dataset.py, scripts/npz_to_npy.py.')
+    frames = np.load(critic_obs_path, mmap_mode='r')
+    terminals = np.load(dataset_path)['terminals']
+    assert len(frames) == len(terminals), f'{critic_obs_path} does not match {dataset_path}.'
+
+    ob_idxs, next_ob_idxs = get_transition_idxs(terminals)
+    dataset['critic_observations'] = IndexedArray(frames, ob_idxs)
+    dataset['next_critic_observations'] = IndexedArray(frames, next_ob_idxs)
+
+
 def get_ogbench_names(dataset_name):
     """Return the environment and dataset file names of an OGBench single-task dataset name."""
     splits = dataset_name.split('-')
@@ -77,15 +95,24 @@ def get_ogbench_names(dataset_name):
     return env_name, dataset_name
 
 
-def make_ogbench_visual_env_and_datasets(dataset_name, dataset_dir=ogbench.utils.DEFAULT_DATASET_DIR):
-    """Memory-efficient version of `ogbench.make_env_and_datasets` for visual single-task datasets."""
+def make_ogbench_visual_env_and_datasets(dataset_name, dataset_dir=ogbench.utils.DEFAULT_DATASET_DIR, fovy_scale=None):
+    """Memory-efficient version of `ogbench.make_env_and_datasets` for visual single-task datasets.
+
+    With `fovy_scale`, the datasets are the ones re-rendered with that camera (`scripts/render_dataset.py`).
+    """
     env_name, dataset_name = get_ogbench_names(dataset_name)
     env = gymnasium.make(env_name)
 
     dataset_dir = os.path.expanduser(dataset_dir)
-    ogbench.download_datasets([dataset_name], dataset_dir)
-    train_dataset = load_shared_obs_dataset(os.path.join(dataset_dir, f'{dataset_name}.npz'))
-    val_dataset = load_shared_obs_dataset(os.path.join(dataset_dir, f'{dataset_name}-val.npz'))
+    suffix = camera_suffix(fovy_scale)
+    if fovy_scale is None:
+        ogbench.download_datasets([dataset_name], dataset_dir)
+    elif not os.path.exists(os.path.join(dataset_dir, f'{dataset_name}{suffix}.npz')):
+        raise FileNotFoundError(
+            f'Run: python scripts/render_dataset.py --dataset_name={dataset_name} --fovy_scale={fovy_scale:g}'
+        )
+    train_dataset = load_shared_obs_dataset(os.path.join(dataset_dir, f'{dataset_name}{suffix}.npz'))
+    val_dataset = load_shared_obs_dataset(os.path.join(dataset_dir, f'{dataset_name}{suffix}-val.npz'))
 
     # Add reward information, then remove the information keys (as with `add_info=False`).
     for dataset in [train_dataset, val_dataset]:
@@ -180,6 +207,8 @@ def make_env_and_datasets(
     action_clip_eps=1e-5,
     dataset_dir=ogbench.utils.DEFAULT_DATASET_DIR,
     add_states=False,
+    fovy_scale=None,
+    critic_fovy_scale=None,
 ):
     """Make offline RL environment and datasets.
 
@@ -189,24 +218,44 @@ def make_env_and_datasets(
         action_clip_eps: Epsilon for action clipping.
         dataset_dir: Directory of the OGBench datasets.
         add_states: Whether to add privileged 'states' and 'next_states' to the datasets (OGBench manipulation only).
+        fovy_scale: Scale of the field of view of the pixel camera, for the environments and (re-rendered) datasets
+            (OGBench pixel-based manipulation only).
+        critic_fovy_scale: If given, add 'critic_observations' rendered with this field-of-view scale to the datasets
+            (OGBench pixel-based manipulation only). The environments are unchanged, since only the actor acts.
 
     Returns:
         A tuple of the environment, evaluation environment, training dataset, and validation dataset.
     """
     if add_states:
         assert 'singletask' in env_name, 'States are only supported for OGBench single-task datasets.'
+    if fovy_scale is not None or critic_fovy_scale is not None:
+        assert 'singletask' in env_name and 'visual' in env_name, 'Cameras only change for OGBench pixel datasets.'
 
     if 'singletask' in env_name:
         # OGBench.
         if 'visual' in env_name:
-            env, train_dataset, val_dataset = make_ogbench_visual_env_and_datasets(env_name, dataset_dir=dataset_dir)
+            env, train_dataset, val_dataset = make_ogbench_visual_env_and_datasets(
+                env_name, dataset_dir=dataset_dir, fovy_scale=fovy_scale
+            )
         else:
             env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name, dataset_dir=dataset_dir)
         if add_states:
-            dataset_path = os.path.join(os.path.expanduser(dataset_dir), get_ogbench_names(env_name)[1])
+            dataset_path = os.path.join(
+                os.path.expanduser(dataset_dir), get_ogbench_names(env_name)[1] + camera_suffix(fovy_scale)
+            )
             add_states_to_dataset(train_dataset, f'{dataset_path}.npz')
             add_states_to_dataset(val_dataset, f'{dataset_path}-val.npz')
+        if critic_fovy_scale is not None:
+            data_dir, dataset_name = os.path.expanduser(dataset_dir), get_ogbench_names(env_name)[1]
+            dataset_path = os.path.join(data_dir, dataset_name + camera_suffix(fovy_scale))
+            critic_path = os.path.join(data_dir, dataset_name + camera_suffix(critic_fovy_scale))
+            add_critic_observations_to_dataset(train_dataset, f'{dataset_path}.npz', f'{critic_path}-observations.npy')
+            add_critic_observations_to_dataset(
+                val_dataset, f'{dataset_path}-val.npz', f'{critic_path}-val-observations.npy'
+            )
         eval_env = ogbench.make_env_and_datasets(env_name, env_only=True)
+        if fovy_scale is not None:
+            env, eval_env = CameraWrapper(env, fovy_scale), CameraWrapper(eval_env, fovy_scale)
         env = EpisodeMonitor(env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         eval_env = EpisodeMonitor(eval_env, filter_regexes=['.*privileged.*', '.*proprio.*'])
         train_dataset = Dataset.create(**train_dataset)

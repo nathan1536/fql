@@ -20,9 +20,15 @@ class FQLAgent(flax.struct.PyTreeNode):
     config: Any = nonpytree_field()
 
     def critic_inputs(self, batch):
-        """Return the critic inputs at the current and next steps (privileged states if `asym_critic`)."""
+        """Return the critic inputs at the current and next steps.
+
+        These are privileged states with `asym_critic`, separate critic observations (e.g., from another camera) with
+        `critic_observations`, and the actor's observations otherwise.
+        """
         if self.config['asym_critic']:
             return batch['states'], batch['next_states']
+        if self.config['critic_observations']:
+            return batch['critic_observations'], batch['next_critic_observations']
         return batch['observations'], batch['next_observations']
 
     def critic_loss(self, batch, grad_params, rng):
@@ -185,6 +191,7 @@ class FQLAgent(flax.struct.PyTreeNode):
         ex_actions,
         config,
         ex_states=None,
+        ex_critic_observations=None,
     ):
         """Create a new agent.
 
@@ -194,6 +201,7 @@ class FQLAgent(flax.struct.PyTreeNode):
             ex_actions: Example batch of actions.
             config: Configuration dictionary.
             ex_states: Example batch of privileged states (required if `asym_critic`).
+            ex_critic_observations: Example batch of critic observations (required if `critic_observations`).
         """
         rng = jax.random.PRNGKey(seed)
         rng, init_rng = jax.random.split(rng, 2)
@@ -201,9 +209,14 @@ class FQLAgent(flax.struct.PyTreeNode):
         ex_times = ex_actions[..., :1]
         ob_dims = ex_observations.shape[1:]
         action_dim = ex_actions.shape[-1]
+        assert not (config['asym_critic'] and config['critic_observations']), 'Choose one critic input.'
         if config['asym_critic']:
             assert ex_states is not None, 'asym_critic requires example states.'
-        ex_critic_observations = ex_states if config['asym_critic'] else ex_observations
+            ex_critic_observations = ex_states
+        elif config['critic_observations']:
+            assert ex_critic_observations is not None, 'critic_observations requires example critic observations.'
+        else:
+            ex_critic_observations = ex_observations
 
         # Define encoders.
         encoders = dict()
@@ -280,6 +293,7 @@ def get_config():
             normalize_q_loss=False,  # Whether to normalize the Q loss.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
             asym_critic=False,  # Whether the critic takes privileged states instead of observations.
+            critic_observations=False,  # Whether the critic takes separate observations ('critic_observations').
         )
     )
     return config

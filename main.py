@@ -43,12 +43,23 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_float('p_aug', None, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('frame_stack', None, 'Number of frames to stack.')
 flags.DEFINE_integer('balanced_sampling', 0, 'Whether to use balanced sampling for online fine-tuning.')
+flags.DEFINE_float('camera_fovy_scale', None, 'Scale of the field of view of the pixel camera (occlusion test).')
+flags.DEFINE_float(
+    'critic_camera_fovy_scale', None, 'If given, the critic sees images with this field-of-view scale (FQL only).'
+)
 flags.DEFINE_integer('frames_on_disk', 0, 'Whether to store online image frames in a file instead of in memory.')
 
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
 
 def main(_):
+    config = FLAGS.agent
+    critic_observations = FLAGS.critic_camera_fovy_scale is not None
+    if critic_observations:
+        # Set before logging the flags, so that the logged config is the one used.
+        assert config['agent_name'] == 'fql', 'Separate critic observations are only supported for FQL.'
+        config['critic_observations'] = True
+
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
     setup_wandb(project='fql', group=FLAGS.run_group, name=exp_name)
@@ -60,10 +71,13 @@ def main(_):
         json.dump(flag_dict, f)
 
     # Make environment and datasets.
-    config = FLAGS.agent
     asym_critic = config.get('asym_critic', False)
     env, eval_env, train_dataset, val_dataset = make_env_and_datasets(
-        FLAGS.env_name, frame_stack=FLAGS.frame_stack, add_states=asym_critic
+        FLAGS.env_name,
+        frame_stack=FLAGS.frame_stack,
+        add_states=asym_critic,
+        fovy_scale=FLAGS.camera_fovy_scale,
+        critic_fovy_scale=FLAGS.critic_camera_fovy_scale,
     )
     if FLAGS.video_episodes > 0:
         assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'
@@ -116,6 +130,8 @@ def main(_):
 
     agent_class = agents[config['agent_name']]
     create_kwargs = dict(ex_states=example_batch['states']) if asym_critic else dict()
+    if critic_observations:
+        create_kwargs['ex_critic_observations'] = example_batch['critic_observations']
     agent = agent_class.create(
         FLAGS.seed,
         example_batch['observations'],

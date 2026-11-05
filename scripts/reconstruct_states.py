@@ -19,11 +19,10 @@ import gymnasium
 import numpy as np
 import ogbench
 from absl import app, flags
-from ogbench.manipspace import lie
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from envs.state_utils import GRIPPER_CONTACT_DIM, reconstruct_state  # noqa: E402
+from envs.state_utils import GRIPPER_CONTACT_DIM, reconstruct_state, singular_yaw_mask  # noqa: E402
 
 FLAGS = flags.FLAGS
 
@@ -35,7 +34,10 @@ flags.DEFINE_bool('check', False, 'Compare with the stored observations (state-b
 flags.DEFINE_bool('save', True, 'Whether to save the states.')
 
 CHECK_ATOL = 1e-5  # Stored qpos/qvel are float32.
-CHECK_MIN_CONTACT_AGREEMENT = 0.999
+# The indicator is a proxy for the stored contact force. In the scene and puzzle environments, the stored force is
+# from one physics timestep earlier while the indicator (like the rest of the state) is not, so they disagree at the
+# moments contact starts or ends (98.6% agreement on scene-play-v0, 99.99% on cube-single-play-v0).
+CHECK_MIN_CONTACT_AGREEMENT = 0.98
 SINGULAR_YAW_RZZ = 1e-2
 
 _env = None
@@ -85,26 +87,12 @@ def reconstruct_file(env_name, path, max_rows):
     return states, file
 
 
-def singular_yaw_mask(env, qpos, shape):
-    """Mask of the cube yaw dimensions (cos, sin) at rows where the cube's z-axis is nearly horizontal.
-
-    The yaw is ill-defined there, so float32 rounding of the stored quaternion can change it arbitrarily.
-    """
-    mask = np.zeros(shape, dtype=bool)
-    for i in range(getattr(env.unwrapped, '_num_cubes', 0)):
-        quat_start = 14 + 7 * i + 3  # qpos: arm and gripper joints (14), then (xyz, wxyz) per cube.
-        rzz = np.array([lie.SO3(wxyz=q).as_matrix()[2, 2] for q in qpos[:, quat_start : quat_start + 4]])
-        yaw_dim = 19 + 9 * i + 7  # Observation: proprio (19), then (xyz, wxyz, cos, sin) per cube.
-        mask[np.abs(rzz) < SINGULAR_YAW_RZZ, yaw_dim : yaw_dim + 2] = True
-    return mask
-
-
 def check(env, states, file, max_rows):
     obs = file['observations'][:max_rows] if max_rows is not None else file['observations']
     qpos = file['qpos'][:max_rows] if max_rows is not None else file['qpos']
     assert obs.shape == states.shape, f'Shape mismatch: stored {obs.shape} vs reconstructed {states.shape}'
     err = np.abs(states.astype(np.float64) - obs)
-    mask = singular_yaw_mask(env, qpos.astype(np.float64), obs.shape)
+    mask = singular_yaw_mask(env, qpos, obs.shape, max_rzz=SINGULAR_YAW_RZZ)
     err[mask] = 0.0
     print(f'  Skipped cube yaw at {mask.any(axis=1).sum()} rows with an ill-defined yaw (|R_zz| < {SINGULAR_YAW_RZZ})')
 

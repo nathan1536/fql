@@ -18,7 +18,12 @@ from absl import app, flags
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from envs.state_utils import GRIPPER_CONTACT_DIM, compute_live_state, reconstruct_state  # noqa: E402
+from envs.state_utils import (  # noqa: E402
+    GRIPPER_CONTACT_DIM,
+    compute_live_state,
+    reconstruct_state,
+    singular_yaw_mask,
+)
 
 FLAGS = flags.FLAGS
 
@@ -38,12 +43,13 @@ def main(_):
     actions, terminals = file['actions'], file['terminals']
     episode_starts = np.concatenate([[0], np.nonzero(terminals)[0][:-1] + 1])
 
-    live, reconstructed = [], []
+    live, reconstructed, qposes = [], [], []
     for episode in range(FLAGS.num_episodes):
         _, info = env.reset(seed=episode)
         t, is_initial, done = episode_starts[episode], True, False
         while True:
             live.append(compute_live_state(env))
+            qposes.append(info['qpos'])
             reconstructed.append(
                 reconstruct_state(
                     state_env,
@@ -60,6 +66,9 @@ def main(_):
 
     live, reconstructed = np.array(live), np.array(reconstructed)
     err = np.abs(live - reconstructed)
+    mask = singular_yaw_mask(state_env, np.array(qposes), err.shape)
+    err[mask] = 0.0
+    print(f'Skipped cube yaw at {mask.any(axis=1).sum()} steps with an ill-defined yaw')
     other_dims = [j for j in range(live.shape[1]) if j != GRIPPER_CONTACT_DIM]
     print(f'{len(live)} steps; contact in {live[:, GRIPPER_CONTACT_DIM].mean():.3f} of them')
     print(f'Max abs error (excluding gripper_contact): {err[:, other_dims].max():.3g} (tolerance {CHECK_ATOL})')

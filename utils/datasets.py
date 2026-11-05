@@ -25,6 +25,12 @@ def random_crop(img, crop_from, padding):
     return jax.lax.dynamic_slice(padded_img, crop_from, img.shape)
 
 
+@jax.jit
+def concatenate_frames(*frames):
+    """Concatenate frames along the last axis (on the accelerator: much faster than NumPy for few channels)."""
+    return jnp.concatenate(frames, axis=-1)
+
+
 @partial(jax.jit, static_argnames=('padding',))
 def batched_random_crop(imgs, crop_froms, padding):
     """Batched version of random_crop."""
@@ -105,25 +111,32 @@ class Dataset(FrozenDict):
         if idxs is None:
             idxs = self.get_random_idxs(batch_size)
         batch = self.get_subset(idxs)
+        # Separate critic observations (e.g., from another camera), if any, are stacked and augmented the same way.
+        ob_keys = [('observations', 'next_observations')]
+        if 'critic_observations' in self:
+            ob_keys.append(('critic_observations', 'next_critic_observations'))
         if self.frame_stack is not None:
             # Stack frames.
             initial_state_idxs = self.initial_locs[np.searchsorted(self.initial_locs, idxs, side='right') - 1]
-            obs = []  # Will be [ob[t - frame_stack + 1], ..., ob[t]].
-            next_obs = []  # Will be [ob[t - frame_stack + 2], ..., ob[t], next_ob[t]].
-            for i in reversed(range(self.frame_stack)):
-                # Use the initial state if the index is out of bounds.
-                cur_idxs = np.maximum(idxs - i, initial_state_idxs)
-                obs.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self['observations']))
-                if i != self.frame_stack - 1:
-                    next_obs.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self['observations']))
-            next_obs.append(jax.tree_util.tree_map(lambda arr: arr[idxs], self['next_observations']))
+            for ob_key, next_ob_key in ob_keys:
+                obs = []  # Will be [ob[t - frame_stack + 1], ..., ob[t]].
+                next_obs = []  # Will be [ob[t - frame_stack + 2], ..., ob[t], next_ob[t]].
+                for i in reversed(range(self.frame_stack)):
+                    # Use the initial state if the index is out of bounds.
+                    cur_idxs = np.maximum(idxs - i, initial_state_idxs)
+                    obs.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self[ob_key]))
+                    if i != self.frame_stack - 1:
+                        next_obs.append(jax.tree_util.tree_map(lambda arr: arr[cur_idxs], self[ob_key]))
+                next_obs.append(jax.tree_util.tree_map(lambda arr: arr[idxs], self[next_ob_key]))
 
-            batch['observations'] = jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *obs)
-            batch['next_observations'] = jax.tree_util.tree_map(lambda *args: np.concatenate(args, axis=-1), *next_obs)
+                batch[ob_key] = jax.tree_util.tree_map(lambda *args: np.asarray(concatenate_frames(*args)), *obs)
+                batch[next_ob_key] = jax.tree_util.tree_map(
+                    lambda *args: np.asarray(concatenate_frames(*args)), *next_obs
+                )
         if self.p_aug is not None:
-            # Apply random-crop image augmentation.
+            # Apply random-crop image augmentation (the same crops for all observation keys).
             if np.random.rand() < self.p_aug:
-                self.augment(batch, ['observations', 'next_observations'])
+                self.augment(batch, [k for keys in ob_keys for k in keys])
         return batch
 
     def get_subset(self, idxs):
