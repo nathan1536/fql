@@ -1,16 +1,18 @@
-"""Re-render the pixel observations of an OGBench manipulation dataset, optionally with a changed camera.
+"""Re-render the pixel observations of an OGBench manipulation dataset with a changed camera or colors.
 
 The stored qpos/qvel (and button states) are written into the simulator and the pixel camera is rendered, as in
 `scripts/reconstruct_states.py`. For each dataset file `<name>.npz` and `<name>-val.npz`, this writes
-`<name><suffix>.npz` and `<name><suffix>-val.npz` (suffix e.g. '-fovy0.35') with the new observations and all other
-keys unchanged, links the state files of the original dataset (the physics is unchanged), and saves how often the
-cube and the gripper are not visible.
+`<name><suffix>.npz` and `<name><suffix>-val.npz` (suffix e.g. '-fovy0.35' or '-nolockcolor') with the new
+observations and all other keys unchanged, links the state files of the original dataset (the physics is unchanged),
+and saves how often the cube and the gripper are not visible.
 
 Usage:
     # Check the re-rendering against the official images (small subsets only: loads the official images).
     python scripts/render_dataset.py --dataset_dir=<subset_dir> --fovy_scale=1 --check
     # Render a dataset with a narrower field of view (zoomed in).
     python scripts/render_dataset.py --dataset_name=visual-cube-single-play-v0 --fovy_scale=0.35
+    # Render a scene dataset without the lock colors of the buttons and handles.
+    python scripts/render_dataset.py --dataset_name=visual-scene-play-v0 --hide_lock_colors
 """
 
 import json
@@ -28,14 +30,15 @@ from absl import app, flags
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from envs.camera_utils import camera_suffix, set_camera  # noqa: E402
+from envs.camera_utils import camera_suffix, hide_lock_colors, set_camera  # noqa: E402
 from envs.state_utils import set_rendered_state  # noqa: E402
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('dataset_name', 'visual-cube-single-play-v0', 'OGBench pixel-based dataset name.')
 flags.DEFINE_string('dataset_dir', ogbench.utils.DEFAULT_DATASET_DIR, 'Dataset directory.')
-flags.DEFINE_float('fovy_scale', 1.0, 'Scale of the field of view of the pixel camera.')
+flags.DEFINE_float('fovy_scale', None, 'Scale of the field of view of the pixel camera (unchanged if None).')
+flags.DEFINE_bool('hide_lock_colors', False, 'Render scene buttons and handles without their lock colors.')
 flags.DEFINE_integer('num_workers', 6, 'Number of worker processes.')
 flags.DEFINE_integer('chunk_size', 2000, 'Number of frames rendered per task.')
 flags.DEFINE_integer('visibility_every', 10, 'Measure visibility on every n-th frame.')
@@ -43,14 +46,17 @@ flags.DEFINE_bool('check', False, 'Compare with the stored observations (loads t
 
 _env = None
 _visibility_every = None
+_hide_lock_colors = False
 
 
-def _init_worker(env_name, fovy_scale, visibility_every):
-    global _env, _visibility_every
+def _init_worker(env_name, fovy_scale, hide_lock, visibility_every):
+    global _env, _visibility_every, _hide_lock_colors
     _visibility_every = visibility_every
+    _hide_lock_colors = hide_lock
     _env = gymnasium.make(env_name)
     _env.reset(seed=0)
-    set_camera(_env, fovy_scale)
+    if fovy_scale is not None:
+        set_camera(_env, fovy_scale)
 
 
 def _geom_ids(u):
@@ -71,6 +77,8 @@ def _render_chunk(args):
         set_rendered_state(
             _env, qpos[i], qvel[i], None if button_states is None else button_states[i], is_initial=is_initial[i]
         )
+        if _hide_lock_colors:
+            hide_lock_colors(_env)  # Setting the state sets the lock colors again.
         frames.append(u.render())
         if (start + i) % _visibility_every == 0:
             seg = u.render(segmentation=True)
@@ -107,7 +115,7 @@ def render_file(env_name, src_path, dst_path):
             with multiprocessing.get_context('spawn').Pool(
                 FLAGS.num_workers,
                 initializer=_init_worker,
-                initargs=(env_name, FLAGS.fovy_scale, FLAGS.visibility_every),
+                initargs=(env_name, FLAGS.fovy_scale, FLAGS.hide_lock_colors, FLAGS.visibility_every),
             ) as pool:
                 # Render a bounded number of chunks at a time to bound memory.
                 for b in range(0, len(tasks), 4 * FLAGS.num_workers):
@@ -137,7 +145,8 @@ def check(src_path, dst_path):
 def main(_):
     splits = FLAGS.dataset_name.split('-')
     env_name = '-'.join(splits[:-2] + splits[-1:])  # Remove the dataset type.
-    suffix = camera_suffix(FLAGS.fovy_scale)
+    suffix = camera_suffix(FLAGS.fovy_scale) + ('-nolockcolor' if FLAGS.hide_lock_colors else '')
+    assert suffix, 'Change the camera or the colors (the output must not overwrite the original dataset).'
     dataset_dir = os.path.expanduser(FLAGS.dataset_dir)
 
     stats = {}
@@ -159,7 +168,16 @@ def main(_):
 
     stats_path = os.path.join(dataset_dir, f'{FLAGS.dataset_name}{suffix}-visibility.json')
     with open(stats_path, 'w') as f:
-        json.dump(dict(fovy_scale=FLAGS.fovy_scale, visibility_every=FLAGS.visibility_every, **stats), f, indent=2)
+        json.dump(
+            dict(
+                fovy_scale=FLAGS.fovy_scale,
+                hide_lock_colors=FLAGS.hide_lock_colors,
+                visibility_every=FLAGS.visibility_every,
+                **stats,
+            ),
+            f,
+            indent=2,
+        )
     print(f'Saved: {stats_path}')
 
 

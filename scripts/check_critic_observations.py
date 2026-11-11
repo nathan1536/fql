@@ -18,6 +18,7 @@ from absl import app, flags
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from envs.camera_utils import camera_suffix  # noqa: E402
 from envs.env_utils import make_env_and_datasets  # noqa: E402
 from utils.datasets import Dataset  # noqa: E402
 
@@ -40,7 +41,7 @@ def load(**kwargs):
 
 
 def main(_):
-    both = load(critic_fovy_scale=FLAGS.critic_fovy_scale)
+    both = load(critic_obs_suffix=camera_suffix(FLAGS.critic_fovy_scale))
     actor_ref = load()
     critic_ref = load(fovy_scale=FLAGS.critic_fovy_scale)
 

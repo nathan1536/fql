@@ -13,6 +13,7 @@ from absl import app, flags
 from ml_collections import config_flags
 
 from agents import agents
+from envs.camera_utils import camera_suffix
 from envs.env_utils import make_env_and_datasets
 from envs.state_utils import compute_live_state
 from utils.datasets import Dataset, FrameReplayBuffer, ReplayBuffer
@@ -34,7 +35,7 @@ flags.DEFINE_integer('online_steps', 0, 'Number of online steps.')
 flags.DEFINE_integer('buffer_size', 2000000, 'Replay buffer size.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
-flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
+flags.DEFINE_integer('save_interval', 100000, 'Saving interval.')
 
 flags.DEFINE_integer('eval_episodes', 50, 'Number of evaluation episodes.')
 flags.DEFINE_integer('video_episodes', 0, 'Number of video episodes for each task.')
@@ -47,6 +48,9 @@ flags.DEFINE_float('camera_fovy_scale', None, 'Scale of the field of view of the
 flags.DEFINE_float(
     'critic_camera_fovy_scale', None, 'If given, the critic sees images with this field-of-view scale (FQL only).'
 )
+flags.DEFINE_string(
+    'critic_obs_suffix', None, "If given, the critic sees re-rendered images, e.g. '-nolockcolor' (FQL only)."
+)
 flags.DEFINE_integer('frames_on_disk', 0, 'Whether to store online image frames in a file instead of in memory.')
 
 config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
@@ -54,7 +58,11 @@ config_flags.DEFINE_config_file('agent', 'agents/fql.py', lock_config=False)
 
 def main(_):
     config = FLAGS.agent
-    critic_observations = FLAGS.critic_camera_fovy_scale is not None
+    assert FLAGS.critic_camera_fovy_scale is None or FLAGS.critic_obs_suffix is None, 'Choose one critic image source.'
+    critic_obs_suffix = FLAGS.critic_obs_suffix
+    if FLAGS.critic_camera_fovy_scale is not None:
+        critic_obs_suffix = camera_suffix(FLAGS.critic_camera_fovy_scale)
+    critic_observations = critic_obs_suffix is not None
     if critic_observations:
         # Set before logging the flags, so that the logged config is the one used.
         assert config['agent_name'] == 'fql', 'Separate critic observations are only supported for FQL.'
@@ -77,7 +85,7 @@ def main(_):
         frame_stack=FLAGS.frame_stack,
         add_states=asym_critic,
         fovy_scale=FLAGS.camera_fovy_scale,
-        critic_fovy_scale=FLAGS.critic_camera_fovy_scale,
+        critic_obs_suffix=critic_obs_suffix,
     )
     if FLAGS.video_episodes > 0:
         assert 'singletask' in FLAGS.env_name, 'Rendering is currently only supported for OGBench environments.'

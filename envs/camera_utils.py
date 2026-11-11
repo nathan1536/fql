@@ -1,12 +1,31 @@
-"""Camera changes for pixel-based OGBench manipulation environments (occlusion test).
+"""Rendering changes for pixel-based OGBench manipulation environments (occlusion tests).
 
-Only the camera of the pixel observations ('front_pixels') changes; the physics is untouched. Narrowing its field of
-view zooms in, so that objects (and the gripper) leave the image part of the time.
+Only the rendering changes; the physics is untouched.
+- Camera: narrowing the field of view of the pixel camera ('front_pixels') zooms in, so that objects (and the gripper)
+  leave the image part of the time.
+- Lock colors: in the scene environments, the buttons and the drawer and window handles are red when locked and white
+  when unlocked. Rendering them in a fixed color removes the lock state from the images.
 """
 
 import gymnasium
+import numpy as np
 
 PIXEL_CAMERA = 'front_pixels'
+# Not the default geom color (0.5, 0.5, 0.5, 1): MuJoCo renders geoms with that color in their material's color.
+LOCK_NEUTRAL_RGBA = np.array([0.6, 0.6, 0.6, 1.0])
+
+
+def hide_lock_colors(env):
+    """Render the buttons and the drawer and window handles of a scene environment in a fixed color.
+
+    The environment sets these colors from the lock state whenever its state is set, so call this before each render.
+    """
+    u = env.unwrapped
+    for ids in u._button_geom_ids_list:
+        for gid in ids:
+            u._model.geom_rgba[gid] = LOCK_NEUTRAL_RGBA
+    u._model.material('drawer_handle').rgba = LOCK_NEUTRAL_RGBA
+    u._model.material('window_handle').rgba = LOCK_NEUTRAL_RGBA
 
 
 def camera_suffix(fovy_scale):
